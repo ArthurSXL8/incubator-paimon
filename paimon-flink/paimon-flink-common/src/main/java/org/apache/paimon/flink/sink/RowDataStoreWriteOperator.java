@@ -18,9 +18,18 @@
 
 package org.apache.paimon.flink.sink;
 
+import org.apache.paimon.KeyValue;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.flink.log.LogWriteCallback;
+import org.apache.paimon.flink.lookup.FixedBucketFromPkExtractor;
+import org.apache.paimon.flink.lookup.FullCacheLookupTable;
+import org.apache.paimon.lookup.LocalCache;
+import org.apache.paimon.mergetree.compact.MergeFunction;
+import org.apache.paimon.mergetree.compact.MergeFunctionFactory;
+import org.apache.paimon.schema.KeyValueFieldsExtractor;
 import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.table.PrimaryKeyTableUtils;
+import org.apache.paimon.table.sink.FixedBucketRowKeyExtractor;
 import org.apache.paimon.table.sink.SinkRecord;
 
 import org.apache.flink.api.common.functions.RichFunction;
@@ -41,9 +50,18 @@ import org.apache.flink.streaming.util.functions.StreamingFunctionUtils;
 
 import javax.annotation.Nullable;
 
+import java.io.File;
 import java.io.IOException;
+import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.UUID;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.IntStream;
+
+import static org.apache.paimon.lookup.RocksDBOptions.LOOKUP_CACHE_ROWS;
 
 /** A {@link PrepareCommitOperator} to write {@link InternalRow}. Record schema is fixed. */
 public class RowDataStoreWriteOperator extends TableWriteOperator<InternalRow> {
@@ -53,7 +71,13 @@ public class RowDataStoreWriteOperator extends TableWriteOperator<InternalRow> {
     @Nullable private final LogSinkFunction logSinkFunction;
     private transient SimpleContext sinkContext;
     @Nullable private transient LogWriteCallback logCallback;
+    private transient LocalCache localCache;
+    // private transient
+    private transient FullCacheLookupTable lookupTable;
+    private transient FixedBucketFromPkExtractor fixedBucketExtractor;
+    private MergeFunction<KeyValue> mf;
 
+    private transient long lastRefreshMillis;
     /** We listen to this ourselves because we don't have an {@link InternalTimerService}. */
     private long currentWatermark = Long.MIN_VALUE;
 
@@ -105,6 +129,21 @@ public class RowDataStoreWriteOperator extends TableWriteOperator<InternalRow> {
 
             logCallback = new LogWriteCallback();
             logSinkFunction.setWriteCallback(logCallback);
+
+            this.lookupTable = newLookupTable();
+            lookupTable.open();
+
+            this.fixedBucketExtractor = new FixedBucketFromPkExtractor(table.schema());
+
+            this.localCache = newLocalCache();
+            localCache.open();
+            lastRefreshMillis = System.currentTimeMillis();
+
+            KeyValueFieldsExtractor extractor =
+                    PrimaryKeyTableUtils.PrimaryKeyFieldsExtractor.EXTRACTOR;
+            MergeFunctionFactory<KeyValue> mfFactory =
+                    PrimaryKeyTableUtils.createMergeFunctionFactory(table.schema(), extractor);
+            mf = mfFactory.create(null);
         }
     }
 
@@ -123,6 +162,7 @@ public class RowDataStoreWriteOperator extends TableWriteOperator<InternalRow> {
     public void processElement(StreamRecord<InternalRow> element) throws Exception {
         sinkContext.timestamp = element.hasTimestamp() ? element.getTimestamp() : null;
 
+        InternalRow row = element.getValue();
         SinkRecord record;
         try {
             record = write.write(element.getValue());
@@ -131,8 +171,16 @@ public class RowDataStoreWriteOperator extends TableWriteOperator<InternalRow> {
         }
 
         if (record != null && logSinkFunction != null) {
+            refreshLookupTableIfNeeded();
+            KeyValue mergedKeyValue = mergeKeyValue(row);
+            InternalRow newValue = mergedKeyValue.value();
+            localCache.put(row, newValue);
+
+            record = toSinkRecord(newValue);
+
             // write to log store, need to preserve original pk (which includes partition fields)
             SinkRecord logRecord = write.toLogRecord(record);
+            LOG.info("logRecord {}", logRecord);
             logSinkFunction.invoke(logRecord, sinkContext);
         }
     }
@@ -162,6 +210,14 @@ public class RowDataStoreWriteOperator extends TableWriteOperator<InternalRow> {
 
         if (logSinkFunction != null) {
             FunctionUtils.closeFunction(logSinkFunction);
+        }
+
+        if (lookupTable != null) {
+            lookupTable.close();
+        }
+
+        if (localCache != null) {
+            localCache.close();
         }
     }
 
@@ -232,5 +288,61 @@ public class RowDataStoreWriteOperator extends TableWriteOperator<InternalRow> {
         public Long timestamp() {
             return timestamp;
         }
+    }
+
+    private LocalCache newLocalCache() throws IOException {
+        String[] tmpDirs = getRuntimeContext().getTaskManagerRuntimeInfo().getTmpDirectories();
+        String rocksDBDir = tmpDirs[ThreadLocalRandom.current().nextInt(tmpDirs.length)];
+        // The TTL
+        return new LocalCache(table, rocksDBDir, 1024, Duration.ofMinutes(10));
+    }
+
+    private KeyValue newKeyValue(InternalRow row) {
+        return new KeyValue().replace(row, KeyValue.UNKNOWN_SEQUENCE, row.getRowKind(), row);
+    }
+
+    private SinkRecord toSinkRecord(InternalRow row) {
+        FixedBucketRowKeyExtractor extractor = new FixedBucketRowKeyExtractor(table.schema());
+        extractor.setRecord(row);
+        return new SinkRecord(
+                extractor.partition(), extractor.bucket(), extractor.trimmedPrimaryKey(), row);
+    }
+
+    private FullCacheLookupTable newLookupTable() {
+        String[] tmpDirs = getRuntimeContext().getTaskManagerRuntimeInfo().getTmpDirectories();
+        String rocksDBDir = tmpDirs[ThreadLocalRandom.current().nextInt(tmpDirs.length)];
+        File path = new File(rocksDBDir, "rocksdb-lookup-" + UUID.randomUUID());
+
+        int[] projection = IntStream.range(0, table.rowType().getFieldCount()).toArray();
+        FullCacheLookupTable.Context context =
+                new FullCacheLookupTable.Context(
+                        table, projection, null, null, path, table.primaryKeys(), null);
+        return FullCacheLookupTable.create(
+                context, Long.parseLong(table.options().get(LOOKUP_CACHE_ROWS)));
+    }
+
+    private void refreshLookupTableIfNeeded() throws Exception {
+        long current = System.currentTimeMillis();
+        if (current - lastRefreshMillis >= TimeUnit.MINUTES.toMillis(5)) {
+            lookupTable.refresh();
+            lastRefreshMillis = current;
+        }
+    }
+
+    private KeyValue mergeKeyValue(InternalRow row) throws IOException {
+        List<InternalRow> rows = new ArrayList<>();
+        InternalRow oldRowValue = localCache.get(row);
+        if (oldRowValue == null) {
+            rows = lookupTable.get(row);
+        } else {
+            rows.add(oldRowValue);
+        }
+
+        rows.add(row);
+
+        for (InternalRow r : rows) {
+            mf.add(newKeyValue(r));
+        }
+        return mf.getResult();
     }
 }

@@ -318,7 +318,7 @@ public abstract class FullCacheLookupTable implements LookupTable {
         void finish() throws IOException;
     }
 
-    static FullCacheLookupTable create(Context context, long lruCacheSize) {
+    public static FullCacheLookupTable create(Context context, long lruCacheSize) {
         List<String> primaryKeys = context.table.primaryKeys();
         if (primaryKeys.isEmpty()) {
             return new NoPrimaryKeyLookupTable(context, lruCacheSize);

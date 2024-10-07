@@ -42,6 +42,11 @@ public interface WriteBuffer {
     boolean put(long sequenceNumber, RowKind valueKind, InternalRow key, InternalRow value)
             throws IOException;
 
+    default InternalRow get(InternalRow key) {
+        throw new UnsupportedOperationException(
+                "InternalRow get(InternalRow key) is not supported");
+    }
+
     /** Record size of this table. */
     int size();
 

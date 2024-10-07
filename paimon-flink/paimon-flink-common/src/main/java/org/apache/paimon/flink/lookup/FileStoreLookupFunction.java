@@ -128,6 +128,32 @@ public class FileStoreLookupFunction implements Serializable, Closeable {
         this.predicate = predicate;
     }
 
+    public FileStoreLookupFunction(
+            Table table, int[] projection, List<String> joinKeys, @Nullable Predicate predicate) {
+        TableScanUtils.streamingReadingValidate(table);
+
+        this.table = table;
+        this.partitionLoader = DynamicPartitionLoader.of(table);
+        this.joinKeys = joinKeys;
+        this.projectFields =
+                Arrays.stream(projection)
+                        .mapToObj(i -> table.rowType().getFieldNames().get(i))
+                        .collect(Collectors.toList());
+
+        // add primary keys
+        for (String field : table.primaryKeys()) {
+            if (!projectFields.contains(field)) {
+                projectFields.add(field);
+            }
+        }
+
+        if (partitionLoader != null) {
+            partitionLoader.addPartitionKeysTo(joinKeys, projectFields);
+        }
+
+        this.predicate = predicate;
+    }
+
     public void open(FunctionContext context) throws Exception {
         this.functionContext = context;
         String tmpDirectory = getTmpDirectory(context);
